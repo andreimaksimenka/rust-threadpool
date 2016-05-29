@@ -180,7 +180,12 @@ impl ThreadPool {
     }
 
     /// Spawns a new dynamic thread pool with `num_threads` maximum threads and
-    /// `num_initial_threads` initial threads.
+    /// `num_initial_threads` initial threads. The thread pool will adjust number
+    /// of running OS threads depending on thread pool utilization. The thread
+    /// pool will try to keep number of running threads at most `num_threads` and
+    /// at least `num_initial_threads` but those are soft boundaries and may be
+    /// temporarily exceeded for efficiency reasons. The tread pool will drop OS
+    /// threads if there are no active jobs left.
     ///
     /// # Panics
     ///
