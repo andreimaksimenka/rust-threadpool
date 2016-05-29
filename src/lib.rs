@@ -31,6 +31,8 @@ struct Sentinel<'a> {
     name: Option<String>,
     jobs: &'a Arc<Mutex<Receiver<Thunk<'static>>>>,
     thread_counter: &'a Arc<AtomicUsize>,
+    thread_count_spawned: &'a Arc<AtomicUsize>,
+    thread_count_min: &'a Arc<AtomicUsize>,
     thread_count_max: &'a Arc<AtomicUsize>,
     thread_count_panic: &'a Arc<AtomicUsize>,
     active: bool,
@@ -40,6 +42,8 @@ impl<'a> Sentinel<'a> {
     fn new(name: Option<String>,
            jobs: &'a Arc<Mutex<Receiver<Thunk<'static>>>>,
            thread_counter: &'a Arc<AtomicUsize>,
+           thread_count_spawned: &'a Arc<AtomicUsize>,
+           thread_count_min: &'a Arc<AtomicUsize>,
            thread_count_max: &'a Arc<AtomicUsize>,
            thread_count_panic: &'a Arc<AtomicUsize>)
            -> Sentinel<'a> {
@@ -47,6 +51,8 @@ impl<'a> Sentinel<'a> {
             name: name,
             jobs: jobs,
             thread_counter: thread_counter,
+            thread_count_spawned: thread_count_spawned,
+            thread_count_min: thread_count_min,
             thread_count_max: thread_count_max,
             thread_count_panic: thread_count_panic,
             active: true,
@@ -62,15 +68,21 @@ impl<'a> Sentinel<'a> {
 impl<'a> Drop for Sentinel<'a> {
     fn drop(&mut self) {
         if self.active {
-            self.thread_counter.fetch_sub(1, Ordering::SeqCst);
             if panicking() {
                 self.thread_count_panic.fetch_add(1, Ordering::SeqCst);
             }
-            spawn_in_pool(self.name.clone(),
-                          self.jobs.clone(),
-                          self.thread_counter.clone(),
-                          self.thread_count_max.clone(),
-                          self.thread_count_panic.clone())
+            if self.thread_counter.fetch_sub(1, Ordering::SeqCst) == 1 &&
+               self.thread_count_spawned.load(Ordering::Acquire) <=
+               self.thread_count_min.load(Ordering::Relaxed) {
+                self.thread_count_spawned.fetch_add(1, Ordering::SeqCst);
+                spawn_in_pool(self.name.clone(),
+                              self.jobs.clone(),
+                              self.thread_counter.clone(),
+                              self.thread_count_spawned.clone(),
+                              self.thread_count_min.clone(),
+                              self.thread_count_max.clone(),
+                              self.thread_count_panic.clone());
+            }
         }
     }
 }
@@ -108,7 +120,8 @@ impl<'a> Drop for Sentinel<'a> {
 /// ## Syncronized with a barrier
 ///
 /// Keep in mind, if you put more jobs in the pool than you have workers,
-/// you will end up with a [deadlock](https://en.wikipedia.org/wiki/Deadlock) which is [not considered unsafe](http://doc.rust-lang.org/reference.html#behavior-not-considered-unsafe).
+/// you will end up with a [deadlock](https://en.wikipedia.org/wiki/Deadlock) which is
+/// [not considered unsafe](http://doc.rust-lang.org/reference.html#behavior-not-considered-unsafe).
 ///
 /// ```
 /// use threadpool::ThreadPool;
@@ -150,6 +163,8 @@ pub struct ThreadPool {
     jobs: Sender<Thunk<'static>>,
     job_receiver: Arc<Mutex<Receiver<Thunk<'static>>>>,
     active_count: Arc<AtomicUsize>,
+    spawned_count: Arc<AtomicUsize>,
+    min_count: Arc<AtomicUsize>,
     max_count: Arc<AtomicUsize>,
     panic_count: Arc<AtomicUsize>,
 }
@@ -161,7 +176,18 @@ impl ThreadPool {
     ///
     /// This function will panic if `num_threads` is 0.
     pub fn new(num_threads: usize) -> ThreadPool {
-        ThreadPool::new_pool(None, num_threads)
+        ThreadPool::new_pool(None, num_threads, num_threads)
+    }
+
+    /// Spawns a new dynamic thread pool with `num_threads` maximum threads and
+    /// `num_initial_threads` initial threads.
+    ///
+    /// # Panics
+    ///
+    /// This function will panic if `num_threads` or `num_initial_threads` is 0,
+    /// or if `num_initial_threads` is greater than `num_threads`.
+    pub fn new_dynamic(num_threads: usize, num_initial_threads: usize) -> ThreadPool {
+        ThreadPool::new_pool(None, num_threads, num_initial_threads)
     }
 
     /// Spawns a new thread pool with `num_threads` threads. Each thread will have the
@@ -195,24 +221,48 @@ impl ThreadPool {
     ///
     /// [thread name]: https://doc.rust-lang.org/std/thread/struct.Thread.html#method.name
     pub fn new_with_name(name: String, num_threads: usize) -> ThreadPool {
-        ThreadPool::new_pool(Some(name), num_threads)
+        ThreadPool::new_pool(Some(name), num_threads, num_threads)
+    }
+
+    /// Spawns a new dynamic thread pool with `num_threads` maximum threads and
+    /// `num_initial_threads` initial threads. Each thread will have the [name][thread name] `name`.
+    ///
+    /// # Panics
+    ///
+    /// This function will panic if `num_threads` or `num_initial_threads` is 0,
+    /// or if `num_initial_threads` is greater than `num_threads`.
+    pub fn new_with_name_dynamic(name: String,
+                                 num_threads: usize,
+                                 num_initial_threads: usize)
+                                 -> ThreadPool {
+        ThreadPool::new_pool(Some(name), num_threads, num_initial_threads)
     }
 
     #[inline]
-    fn new_pool(name: Option<String>, num_threads: usize) -> ThreadPool {
+    fn new_pool(name: Option<String>,
+                num_threads: usize,
+                num_initial_threads: usize)
+                -> ThreadPool {
         assert!(num_threads >= 1);
+        assert!(num_initial_threads >= 1);
+        assert!(num_initial_threads <= num_threads);
 
         let (tx, rx) = channel::<Thunk<'static>>();
         let rx = Arc::new(Mutex::new(rx));
         let active_count = Arc::new(AtomicUsize::new(0));
+        let spawned_count = Arc::new(AtomicUsize::new(0));
+        let min_count = Arc::new(AtomicUsize::new(num_initial_threads));
         let max_count = Arc::new(AtomicUsize::new(num_threads));
         let panic_count = Arc::new(AtomicUsize::new(0));
 
         // Threadpool threads
-        for _ in 0..num_threads {
+        for _ in 0..num_initial_threads {
+            spawned_count.fetch_add(1, Ordering::SeqCst);
             spawn_in_pool(name.clone(),
                           rx.clone(),
                           active_count.clone(),
+                          spawned_count.clone(),
+                          min_count.clone(),
                           max_count.clone(),
                           panic_count.clone());
         }
@@ -222,6 +272,8 @@ impl ThreadPool {
             jobs: tx,
             job_receiver: rx.clone(),
             active_count: active_count,
+            spawned_count: spawned_count,
+            min_count: min_count,
             max_count: max_count,
             panic_count: panic_count,
         }
@@ -231,6 +283,18 @@ impl ThreadPool {
     pub fn execute<F>(&self, job: F)
         where F: FnOnce() + Send + 'static
     {
+        // Spawn a new thread if the pool is dynamically managed and the number
+        // of active threads is smaller than the maximum allowed.
+        if self.spawned_count.load(Ordering::Acquire) < self.max_count.load(Ordering::Relaxed) {
+            self.spawned_count.fetch_add(1, Ordering::SeqCst);
+            spawn_in_pool(self.name.clone(),
+                          self.job_receiver.clone(),
+                          self.active_count.clone(),
+                          self.spawned_count.clone(),
+                          self.min_count.clone(),
+                          self.max_count.clone(),
+                          self.panic_count.clone());
+        }
         self.jobs.send(Box::new(move || job())).unwrap();
     }
 
@@ -239,7 +303,17 @@ impl ThreadPool {
         self.active_count.load(Ordering::Relaxed)
     }
 
-    /// Returns the number of created threads
+    /// Returns the number of spawned threads.
+    pub fn spawned_count(&self) -> usize {
+        self.spawned_count.load(Ordering::Relaxed)
+    }
+
+    /// Returns the minimum number of created threads.
+    pub fn min_count(&self) -> usize {
+        self.min_count.load(Ordering::Relaxed)
+    }
+
+    /// Returns the maximum number of created threads.
     pub fn max_count(&self) -> usize {
         self.max_count.load(Ordering::Relaxed)
     }
@@ -265,9 +339,12 @@ impl ThreadPool {
         if num_threads > current_max {
             // Spawn new threads
             for _ in 0..(num_threads - current_max) {
+                self.spawned_count.fetch_add(1, Ordering::SeqCst);
                 spawn_in_pool(self.name.clone(),
                               self.job_receiver.clone(),
                               self.active_count.clone(),
+                              self.spawned_count.clone(),
+                              self.min_count.clone(),
                               self.max_count.clone(),
                               self.panic_count.clone());
             }
@@ -278,6 +355,8 @@ impl ThreadPool {
 fn spawn_in_pool(name: Option<String>,
                  jobs: Arc<Mutex<Receiver<Thunk<'static>>>>,
                  thread_counter: Arc<AtomicUsize>,
+                 thread_count_spawned: Arc<AtomicUsize>,
+                 thread_count_min: Arc<AtomicUsize>,
                  thread_count_max: Arc<AtomicUsize>,
                  thread_count_panic: Arc<AtomicUsize>) {
     let mut builder = Builder::new();
@@ -285,16 +364,20 @@ fn spawn_in_pool(name: Option<String>,
         builder = builder.name(name.clone());
     }
     builder.spawn(move || {
+
             // Will spawn a new thread on panic unless it is cancelled.
             let sentinel = Sentinel::new(name,
                                          &jobs,
                                          &thread_counter,
+                                         &thread_count_spawned,
+                                         &thread_count_min,
                                          &thread_count_max,
                                          &thread_count_panic);
 
             loop {
                 // Shutdown this thread if the pool has become smaller
                 let thread_counter_val = thread_counter.load(Ordering::Acquire);
+                let thread_count_min_val = thread_count_min.load(Ordering::Relaxed);
                 let thread_count_max_val = thread_count_max.load(Ordering::Relaxed);
                 if thread_counter_val < thread_count_max_val {
                     let message = {
@@ -310,6 +393,13 @@ fn spawn_in_pool(name: Option<String>,
                             thread_counter.fetch_add(1, Ordering::SeqCst);
                             job.call_box();
                             thread_counter.fetch_sub(1, Ordering::SeqCst);
+                            // Shutdown this thread if there are no active jobs and number of
+                            // spawned threads more than the minimum.
+                            if thread_count_min_val != thread_count_max_val &&
+                               thread_counter.load(Ordering::Acquire) == 0 &&
+                               thread_count_spawned.load(Ordering::Acquire) > thread_count_min_val {
+                                break;
+                            }
                         }
 
                         // The ThreadPool was dropped.
@@ -320,6 +410,7 @@ fn spawn_in_pool(name: Option<String>,
                 }
             }
 
+            thread_count_spawned.fetch_sub(1, Ordering::SeqCst);
             sentinel.cancel();
         })
         .unwrap();
@@ -532,10 +623,67 @@ mod test {
         assert_eq!(pool.active_count(), test_tasks_begin);
         b1.wait();
 
-
         b2.wait();
         assert_eq!(pool.active_count(), TEST_TASKS);
         b3.wait();
+    }
+
+    #[test]
+    fn test_shrink_then_grow_dynamic() {
+        let test_tasks_begin = TEST_TASKS + 2;
+
+        let mut pool = ThreadPool::new_dynamic(test_tasks_begin, 1);
+        assert_eq!(pool.spawned_count(), 1);
+
+        let b0 = Arc::new(Barrier::new(test_tasks_begin + 1));
+        let b1 = Arc::new(Barrier::new(test_tasks_begin + 1));
+
+        for _ in 0..test_tasks_begin {
+            let (b0, b1) = (b0.clone(), b1.clone());
+            pool.execute(move || {
+                b0.wait();
+                b1.wait();
+            });
+        }
+        assert_eq!(pool.spawned_count(), test_tasks_begin);
+
+        let b2 = Arc::new(Barrier::new(TEST_TASKS + 1));
+        let b3 = Arc::new(Barrier::new(TEST_TASKS + 1));
+
+        for _ in 0..TEST_TASKS {
+            let (b2, b3) = (b2.clone(), b3.clone());
+            pool.execute(move || {
+                b2.wait();
+                b3.wait();
+            });
+        }
+
+        b0.wait();
+        pool.set_num_threads(TEST_TASKS);
+
+        assert_eq!(pool.active_count(), test_tasks_begin);
+        assert_eq!(pool.spawned_count(), test_tasks_begin);
+        b1.wait();
+
+        b2.wait();
+        assert_eq!(pool.active_count(), TEST_TASKS);
+        assert_eq!(pool.spawned_count(), TEST_TASKS);
+        b3.wait();
+
+        pool.set_num_threads(test_tasks_begin);
+        let b4 = Arc::new(Barrier::new(test_tasks_begin + 1));
+        let b5 = Arc::new(Barrier::new(test_tasks_begin + 1));
+
+        for _ in 0..test_tasks_begin {
+            let (b4, b5) = (b4.clone(), b5.clone());
+            pool.execute(move || {
+                b4.wait();
+                b5.wait();
+            });
+        }
+        b4.wait();
+        assert_eq!(pool.spawned_count(), test_tasks_begin);
+        b5.wait();
     }
 
     #[test]
